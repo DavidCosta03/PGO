@@ -719,8 +719,7 @@ def generate_neighborhood(
     route_day_assignment: Optional[Dict[int, int]] = None,
     basket: Optional[Dict[int, float]] = None
 ):
-    """
-    Generates a neighborhood for the given move type.
+    """Generates a neighborhood for the given move type.
     Returns neighbors as tuples:
       (clusters_new, zones_new, zone_customers_new, unassigned_new, route_day_assignment_new)
     """
@@ -1106,7 +1105,9 @@ def local_search(initial_solution, travel_times, service_times, customer_zone_di
         global_best_tuple = (curr_obj, curr_pen, curr_score, curr_ap, curr_rdt)
         global_best_move = None
 
-        for move in move_types:
+        # Phase 1: try all moves except 'merge_routes' first
+        primary_moves = [m for m in move_types if m != 'merge_routes']
+        for move in primary_moves:
             # Generate neighborhood for this move
             neighbors = generate_neighborhood(
                 current_solution, clusters, zones, zone_customers, unassigned_customers, days,
@@ -1128,6 +1129,28 @@ def local_search(initial_solution, travel_times, service_times, customer_zone_di
                 global_best_nb = best_nb
                 global_best_tuple = best_tuple
                 global_best_move = move
+
+        # Phase 2: only if no improvement found among primary moves, try 'merge_routes'
+        if global_best_nb is None and 'merge_routes' in move_types:
+            move = 'merge_routes'
+            neighbors = generate_neighborhood(
+                current_solution, clusters, zones, zone_customers, unassigned_customers, days,
+                move=move, sample_limit=sample_limit, customer_zone=customer_zone,
+                route_day_assignment=route_day_assignment, basket=basket
+            )
+
+            best_nb = None
+            best_tuple = (curr_obj, curr_pen, curr_score, curr_ap, curr_rdt)
+            for nb in neighbors:
+                obj, pen, score, ap, rdt = evaluate(nb)
+                if score > best_tuple[2]:
+                    best_nb = nb
+                    best_tuple = (obj, pen, score, ap, rdt)
+
+            if best_nb is not None and best_tuple[2] > global_best_tuple[2]:
+                global_best_nb = best_nb
+                global_best_tuple = best_tuple
+                global_best_move = 'merge_routes'
 
         # After checking all moves, accept the global best if it improves the current score
         if global_best_nb is not None and global_best_tuple[2] > curr_score:
@@ -1253,7 +1276,7 @@ def print_solution(solution, travel_times, service_times, customer_zone_distance
 
 if __name__ == '__main__':
     # Manually set the instance name here
-    instance = 'instances\S333n90d3w6-120p5-4-8c5_1677773750.txt'
+    instance = 'instances\S333n90d3w6-120p5-4-8c5_1677773745.txt'
     
     # Resolve relative paths to absolute
     if not os.path.isabs(instance):
