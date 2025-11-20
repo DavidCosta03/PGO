@@ -1,0 +1,1352 @@
+import os
+import sys
+import re
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import silhouette_score
+from sklearn.utils.multiclass import unique_labels
+from collections import defaultdict
+from sklearn.decomposition import PCA
+import itertools
+import copy
+import random
+from typing import Dict, List, Tuple, Optional
+
+# Large fallback distance for missing travel times (configurable)
+BIG_DISTANCE = 1e6
+
+# Global mapping price_id -> fee (populated per-instance in __main__)
+PRICE_FEES = {}
+
+def read_instance_file(filepath):
+    with open(filepath, 'r') as file:
+        return file.read()
+
+def parse_instance(content):
+    def extract_section(section_name):
+        pattern = rf'{section_name}:(.*?)(\n[A-Za-z ]+:|\Z)'
+        match = re.search(pattern, content, re.S)
+        return match.group(1).strip() if match else ''
+
+
+    def parse_key_value_section(text, key_label, value_label):
+        d = {}
+        for line in text.split('\n'):
+            if line.strip() and not line.lower().startswith(key_label.lower()) and not line.lower().startswith(value_label.lower()):
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    d[int(parts[0])] = float(parts[1])
+        return d
+
+
+    basket_text = extract_section('Basket value')
+    basket = parse_key_value_section(basket_text, 'id_customer', 'basket')
+
+
+    service_text = extract_section('Service time')
+    service_times = parse_key_value_section(service_text, 'id_customer', 'service_time')
+
+
+    dist_text = extract_section('Distance matrix')
+    dist_records = [line.split(',') for line in dist_text.split('\n') if line.strip() and not line.lower().startswith('zone')]
+    dist_df = pd.DataFrame(dist_records, columns=['zone_1', 'zone_2', 'distance'])
+    dist_df = dist_df.astype({'zone_1': int, 'zone_2': int, 'distance': float})
+    travel_times = {(row['zone_1'], row['zone_2']): row['distance'] for _, row in dist_df.iterrows()}
+
+    # Parse Fees line, e.g. "Fees: 5 6 7 8" -> map price_id 1->5, 2->6, ...
+    fees = {}
+    m = re.search(r'Fees:\s*(.*)', content)
+    if m:
+        nums = re.findall(r"\d+", m.group(1))
+        for idx, val in enumerate(nums, start=1):
+            try:
+                fees[idx] = float(val)
+            except Exception:
+                fees[idx] = float(0)
+
+
+    return {
+        'basket': basket,
+        'service_times': service_times,
+        'travel_times': travel_times,
+        'fees': fees,
+    }
+
+def parse_time_windows(content):
+    def extract_section(section_name):
+        pattern = rf'{section_name}:(.*?)(\n[A-Za-z ]+:|\Z)'
+        match = re.search(pattern, content, re.S)
+        return match.group(1).strip() if match else ''
+    
+    tw_text = extract_section('Time windows')
+    tw_records = [line.split(',') for line in tw_text.split('\n') if line.strip() and not line.lower().startswith('id')]
+    time_windows_info = {}
+    for rec in tw_records:
+        tw_id = int(rec[0])
+        start = int(rec[1])
+        end = int(rec[2])
+        time_windows_info[tw_id] = (start, end)
+    return time_windows_info
+
+def parse_customer_preferences(file_content):
+    idx = file_content.find("Preferences")
+    if idx == -1:
+        return {}
+    rest = file_content[idx:]
+    lines = rest.split('\n')[1:]
+
+
+    customer_prefs = {}
+    for line in lines:
+        if not line.strip():
+            break
+        nums = re.findall(r'\d+', line)
+        if not nums:
+            continue
+        cust_id = int(nums[0])
+        prefs = []
+        i = 1
+        while i + 2 < len(nums):
+            tw_id = int(nums[i])
+            day_id = int(nums[i + 1])
+            price_id = int(nums[i + 2])
+            prefs.append({'time_window_id': tw_id, 'day_id': day_id, 'price_id': price_id})
+            i += 3
+        customer_prefs[cust_id] = prefs
+    return customer_prefs
+
+def parse_customer_zone_distances(content):
+    def extract_section(section_name):
+        pattern = rf'{section_name}:(.*?)(\n[A-Za-z ]+:|\Z)'
+        match = re.search(pattern, content, re.S)
+        return match.group(1).strip() if match else ''
+
+
+    cust_zone_text = extract_section('Customer distance to zone center')
+    cust_zone_dist = {}
+    for line in cust_zone_text.split('\n'):
+        if line.strip() and not line.lower().startswith('id'):
+            cust_id, dist = line.split(',')
+            cust_zone_dist[int(cust_id)] = float(dist)
+    return cust_zone_dist
+
+def parse_customer_zones(content):
+    def extract_section(section_name):
+        pattern = rf'{section_name}:(.*?)(\n[A-Za-z ]+:|\Z)'
+        match = re.search(pattern, content, re.S)
+        return match.group(1).strip() if match else ''
+
+    cust_zone_text = extract_section('Customer zone')
+    customer_zones = {}
+    for line in cust_zone_text.split('\n'):
+        if line.strip() and not line.lower().startswith('id'):
+            cust_id, zone_id = line.split(',')
+            customer_zones[int(cust_id)] = int(zone_id)
+    return customer_zones
+
+def parse_days(content):
+    def extract_section(section_name):
+        pattern = rf'{section_name}:(.*?)(\n[A-Za-z ]+:|\Z)'
+        match = re.search(pattern, content, re.S)
+        return match.group(1).strip() if match else ''
+
+    days_text = extract_section('Number of days')
+    if days_text:
+        # Support two formats:
+        # 1) A single integer N meaning "number of days" (e.g. "3" -> [1,2,3])
+        # 2) Explicit day lines listing day ids (e.g. "1\n2\n3")
+        day_records = [line.strip() for line in days_text.split('\n') if line.strip()]
+        # If a single numeric line is provided, treat it as a count and expand to [1..N]
+        if len(day_records) == 1 and re.fullmatch(r"\d+", day_records[0]):
+            n = int(day_records[0])
+            return list(range(1, n + 1))
+        # Otherwise parse any numeric tokens on each line as explicit day ids
+        days = []
+        for dr in day_records:
+            # allow lines that may contain commas or extra text; extract first integer token
+            m = re.search(r"\d+", dr)
+            if m:
+                days.append(int(m.group(0)))
+        return days
+    return []
+
+def print_silhouette_scores(k_values, scores):
+    print("\nSilhouette Scores:")
+    valid_scores = [s for s in scores if s >= 0]
+    if not valid_scores:
+        print("No valid silhouette scores to display (all invalid or undefined).\n")
+        return
+    max_score = max(valid_scores)
+    scale = 40  # max bar length in characters
+    for k, score in zip(k_values, scores):
+        if score < 0:
+            print(f"k={k:2d}: {'-'*scale}  N/A")
+        else:
+            bar_length = int(scale * score / max_score)
+            print(f"k={k:2d}: [{'#' * bar_length}{'.' * (scale - bar_length)}] {score:.4f}")
+
+def ascii_scatter_plot(coords, labels, width=50, height=20):
+    min_x, max_x = coords[:,0].min(), coords[:,0].max()
+    min_y, max_y = coords[:,1].min(), coords[:,1].max()
+    norm_x = (coords[:,0] - min_x) / (max_x - min_x) if max_x > min_x else coords[:,0]*0 + 0.5
+    norm_y = (coords[:,1] - min_y) / (max_y - min_y) if max_y > min_y else coords[:,1]*0 + 0.5
+    
+    ix = (norm_x * (width - 1)).astype(int)
+    iy = ((1 - norm_y) * (height - 1)).astype(int)
+    
+    grid = [[' ' for _ in range(width)] for _ in range(height)]
+    
+    symbols = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    
+    for x, y, label in zip(ix, iy, labels):
+        symbol = symbols[label % len(symbols)]
+        grid[y][x] = symbol
+    
+    print("\nASCII Scatter Plot (approximate)")
+    for row in grid:
+        print(''.join(row))
+    print("Legend: Symbols represent cluster ids.\n")
+
+def clustering(filepath):
+    content = read_instance_file(filepath)
+
+    data = parse_instance(content)
+    customer_zones = parse_customer_zones(content)
+    customer_zone_distances = parse_customer_zone_distances(content)
+    travel_times = data['travel_times']
+    basket = data['basket']
+
+    min_distance_threshold = 0.1
+    zone_basket, zone_distance, zone_customers = {}, {}, {}
+
+    for cust_id, zone_id in customer_zones.items():
+        if zone_id == 0:
+            continue
+        zone_customers.setdefault(zone_id, []).append(cust_id)
+        zone_basket[zone_id] = zone_basket.get(zone_id, 0) + basket.get(cust_id, 0)
+
+    for zone_id, cust_list in zone_customers.items():
+        total_dist = sum(customer_zone_distances.get(cust_id, 0.0) for cust_id in cust_list)
+        zone_distance[zone_id] = max(total_dist, min_distance_threshold)
+
+    log_c = 1e-6
+    zone_ratios = {}
+    print("Zone baskets and basket/intra-zone distance ratios (log-transformed):")
+    for zone_id in zone_basket:
+        raw_ratio = zone_basket[zone_id] / zone_distance[zone_id]
+        log_ratio = np.log(raw_ratio + log_c)
+        zone_ratios[zone_id] = log_ratio
+        print(f"Zone {zone_id}: Basket={zone_basket[zone_id]:.2f}, Ratio={raw_ratio:.6f}, Log-Ratio={log_ratio:.6f}")
+
+    zone_list = sorted(zone_ratios.keys())
+    feature_matrix = []
+
+    print("\nPairwise combined (log) basket ratios divided by distance:")
+    for zone_i in zone_list:
+        features = []
+        for zone_j in zone_list:
+            if zone_i == zone_j:
+                val = zone_ratios[zone_i]
+            else:
+                dist = travel_times.get((zone_i, zone_j), travel_times.get((zone_j, zone_i), BIG_DISTANCE))
+                combined_ratio = (zone_ratios[zone_i] + zone_ratios[zone_j]) / 2
+                val = combined_ratio / dist
+                print(f"Zones {zone_i}-{zone_j}: CombinedRatio={combined_ratio:.6f}, Distance={dist:.3f} => {val:.6f}")
+            features.append(val)
+        feature_matrix.append(features)
+    feature_matrix = np.array(feature_matrix)
+
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(feature_matrix)
+
+    best_k = 2
+    best_score = -1
+    range_k = range(2, min(9, len(zone_list) + 1))
+    scores = []
+
+    for k in range_k:
+        clustering = AgglomerativeClustering(n_clusters=k, linkage='average')
+        labels = clustering.fit_predict(scaled_features)
+        if k <= 1 or k >= len(scaled_features):
+            score = -1
+        else:
+            score = silhouette_score(scaled_features, labels)
+        scores.append(score)
+        if score > best_score:
+            best_k = k
+            best_score = score
+
+    print_silhouette_scores(list(range_k), scores)
+    print(f"\nBest k by silhouette score: {best_k} (score={best_score:.4f})")
+
+    clustering_final = AgglomerativeClustering(n_clusters=best_k, linkage='average')
+    clusters_final = clustering_final.fit_predict(scaled_features)
+
+    print("\nFinal cluster assignments:")
+    for zone, clust in zip(zone_list, clusters_final):
+        print(f"Zone {zone}: Cluster {clust}")
+
+    cluster_basket = defaultdict(float)
+    cluster_customers = defaultdict(int)
+    cluster_distance = defaultdict(float)
+
+    for zone, cluster_id in zip(zone_list, clusters_final):
+        cluster_basket[cluster_id] += zone_basket[zone]
+        cluster_customers[cluster_id] += len(zone_customers[zone])
+        cluster_distance[cluster_id] += zone_distance[zone]
+
+    pca = PCA(n_components=2, random_state=42)
+    reduced = pca.fit_transform(scaled_features)
+    ascii_scatter_plot(reduced, clusters_final)
+
+    print("\nCluster summaries:")
+    for cluster_id in sorted(cluster_basket.keys()):
+        print(f"Cluster {cluster_id}: Total Basket Value = {cluster_basket[cluster_id]:.2f}, "
+              f"Total Customers = {cluster_customers[cluster_id]}, "
+              f"Total Distance = {cluster_distance[cluster_id]:.2f}")
+        
+    return clusters_final, zone_list, zone_ratios, zone_customers, basket
+
+def create_routes_by_cluster(clusters_final, zone_list, zone_ratios, zone_customers, basket):
+    routes = {}
+
+    # Group zones by cluster
+    cluster_zones = {}
+    for zone, cluster_id in zip(zone_list, clusters_final):
+        cluster_zones.setdefault(cluster_id, []).append(zone)
+
+    for cluster_id, zones in cluster_zones.items():
+        # Sort zones by descending zone ratio within cluster
+        sorted_zones = sorted(zones, key=lambda z: zone_ratios[z], reverse=True)
+
+        cluster_route = []
+        for zone in sorted_zones:
+            # Sort customers in zone by descending basket value
+            customers = zone_customers.get(zone, [])
+            sorted_customers = sorted(customers, key=lambda c: basket.get(c, 0), reverse=True)
+            cluster_route.append((zone, sorted_customers))
+
+        routes[cluster_id] = cluster_route
+
+    return routes
+
+def calculate_delivery_times(routes, travel_times, service_times, zone_customers, cust_zone_distances, time_windows, speed=2):
+    """Print a delivery schedule per cluster (side-effect).
+
+    This function prints arrival/leave times for customers in each cluster.
+    Units: distances in same units as travel_times; `speed` is time units per distance (e.g., minutes/km).
+    """
+    depot_zone = 0
+
+    # Find the earliest time window start globally (if available)
+    global_earliest_start = min((tw[0] for tw in time_windows.values()), default=0) if time_windows else 0
+
+    for cluster_id, cluster_route in routes.items():
+        current_time = 0.0
+        print(f"\nCluster {cluster_id} Delivery Schedule (first service not before {global_earliest_start}):")
+        last_zone = depot_zone
+        first_customer_serviced = False
+
+        for zone, customers in cluster_route:
+            dist_zone = travel_times.get((last_zone, zone), travel_times.get((zone, last_zone), BIG_DISTANCE))
+            travel_zone_time = dist_zone * speed
+            current_time += travel_zone_time
+            print(f"Travel from Zone {last_zone} to Zone {zone}: {dist_zone:.2f} km = {travel_zone_time:.1f} min")
+            last_zone = zone
+
+            for cust in customers:
+                cust_dist = cust_zone_distances.get(cust, 0.0)
+                travel_to_cust = cust_dist * speed
+                arrive = current_time + travel_to_cust
+
+                tw_start, tw_end = time_windows.get(cust, (0, float('inf')))
+
+                if not first_customer_serviced:
+                    earliest_service_time = max(global_earliest_start, tw_start)
+                    if arrive < earliest_service_time:
+                        wait = earliest_service_time - arrive
+                        arrive = earliest_service_time
+                    else:
+                        wait = 0.0
+                    first_customer_serviced = True
+                else:
+                    wait = 0.0
+
+                serv_time = service_times.get(cust, 0.0)
+                leave = arrive + serv_time
+
+                print(
+                    f"Customer {cust} in Zone {zone}: Arrive at {arrive:.1f} min, Leave at {leave:.1f} min "
+                    f"(Travel to cust {travel_to_cust:.1f} min, Wait {wait:.1f} min, Service {serv_time} min)"
+                )
+
+                current_time = leave
+
+        dist_return = travel_times.get((last_zone, depot_zone), travel_times.get((depot_zone, last_zone), BIG_DISTANCE))
+        travel_return_time = dist_return * speed
+        current_time += travel_return_time
+        print(f"Return to depot from Zone {last_zone}: {dist_return:.2f} km = {travel_return_time:.1f} min")
+        print(f"End of Cluster {cluster_id} route at time {current_time:.1f} min")
+
+def score_route_day_fit(routes_customers, customer_prefs, time_windows, route_delivery_times, days):
+    # Use actual fees (price -> fee) when scoring day fits. Falls back to price id if fees missing.
+    route_day_scores = {}
+
+    for route_id, customers in routes_customers.items():
+        route_day_scores[route_id] = {}
+        for day in days:
+            total_score = 0.0
+            for cust in customers:
+                prefs = customer_prefs.get(cust, [])
+                # Filter prefs for this day
+                day_prefs = [p for p in prefs if p['day_id'] == day]
+                if not day_prefs:
+                    continue
+
+                # Optional: get delivery time window for customer from estimated delivery times, if available
+                cust_time = None
+                if route_delivery_times and cust in route_delivery_times.get(route_id, {}):
+                    cust_time = route_delivery_times[route_id][cust]
+
+                # Score preferences by actual fee if time_window compatible or no delivery time given
+                cust_score = 0.0
+                # Sort candidate prefs by fee (descending) so we prefer higher-fee options
+                sorted_prefs = sorted(day_prefs, key=lambda x: PRICE_FEES.get(x['price_id'], x['price_id']), reverse=True)
+                for p in sorted_prefs:
+                    tw_start, tw_end = time_windows.get(p['time_window_id'], (0, 24*60))
+                    if cust_time is None or (tw_start <= cust_time <= tw_end):
+                        cust_score = float(PRICE_FEES.get(p['price_id'], p.get('price_id', 0)))
+                        break
+                total_score += cust_score
+
+            route_day_scores[route_id][day] = total_score
+
+    return route_day_scores
+
+
+def assign_days_to_routes(route_day_scores):
+    route_day_assignment = {}
+    for route_id, day_scores in route_day_scores.items():
+        # Pick day with max score for this route
+        best_day = max(day_scores, key=day_scores.get)
+        route_day_assignment[route_id] = best_day
+    return route_day_assignment
+
+def assign_preferences_to_customers(routes_customers, customer_prefs, route_day_assignment, time_windows, route_delivery_times):
+    assigned_preferences = {}
+    for route_id, customers in routes_customers.items():
+        day = route_day_assignment[route_id]
+        for cust in customers:
+            prefs = [p for p in customer_prefs.get(cust, []) if p['day_id'] == day]
+            cust_time = None
+            if route_delivery_times and cust in route_delivery_times.get(route_id, {}):
+                cust_time = route_delivery_times[route_id][cust]
+            
+            selected_pref = None
+            # Prefer the preference with the largest fee (mapped from price_id)
+            if prefs:
+                prefs_sorted = sorted(prefs, key=lambda x: PRICE_FEES.get(x['price_id'], x['price_id']), reverse=True)
+                for p in prefs_sorted:
+                    tw_start, tw_end = time_windows.get(p['time_window_id'], (0, 24*60))
+                    if cust_time is None or (tw_start <= cust_time <= tw_end):
+                        selected_pref = p
+                        break
+            
+            assigned_preferences[cust] = selected_pref
+    return assigned_preferences
+
+def calculate_objective(assigned_preferences, basket, routes, travel_times):
+    """Compute the objective (profit) for the given routes and assigned preferences.
+
+    Formula (kept from original):
+      obj = 0.25*total_basket_value + total_fee - 0.27*total_distance - 180*routes_used
+    """
+    total_basket_value = 0.0
+    total_fee = 0.0
+    total_distance = 0.0
+    depot_zone = 0
+    routes_used = len(routes)
+
+    for route_id, cluster_route in routes.items():
+        last_zone = depot_zone
+        route_distance = 0.0
+
+        for zone, customers in cluster_route:
+            dist = travel_times.get((last_zone, zone), travel_times.get((zone, last_zone), BIG_DISTANCE))
+            route_distance += dist
+            last_zone = zone
+
+            for cust in customers:
+                total_basket_value += basket.get(cust, 0.0)
+                pref = assigned_preferences.get(cust)
+                if pref is not None:
+                    price_id = pref.get('price_id')
+                    # Map price id to actual fee; fallback to numeric id if fees missing
+                    total_fee += float(PRICE_FEES.get(price_id, price_id if price_id is not None else 0))
+
+        # Add return distance to depot
+        dist_back = travel_times.get((last_zone, depot_zone), travel_times.get((depot_zone, last_zone), BIG_DISTANCE))
+        route_distance += dist_back
+        total_distance += route_distance
+
+    objective = 0.25 * total_basket_value + total_fee - 0.27 * total_distance - 180 * routes_used
+    return objective
+
+# Filter customers per route to only those with assigned preferences
+def filter_routes_customers_by_assigned_prefs(routes, assigned_preferences):
+    filtered_routes = {}
+    for route_id, cluster_route in routes.items():
+        filtered_cluster_route = []
+        for zone, customers in cluster_route:
+            filtered_customers = [c for c in customers if assigned_preferences.get(c) is not None]
+            if filtered_customers:
+                filtered_cluster_route.append((zone, filtered_customers))
+        if filtered_cluster_route:
+            filtered_routes[route_id] = filtered_cluster_route
+    return filtered_routes
+
+def get_route_delivery_times(routes, travel_times, service_times, cust_zone_distances, time_windows, speed=2):
+    """Return a dict mapping route_id -> {customer_id: arrival_time}.
+
+    Uses BIG_DISTANCE as fallback for missing travel times. `speed` is time-per-distance.
+    """
+    depot_zone = 0
+    route_delivery_times = {}
+    for rid, cluster_route in routes.items():
+        current_time = 0.0
+        last_zone = depot_zone
+        route_delivery_times[rid] = {}
+        first_customer_serviced = False
+
+        for zone, customers in cluster_route:
+            dist_zone = travel_times.get((last_zone, zone), travel_times.get((zone, last_zone), BIG_DISTANCE))
+            current_time += dist_zone * speed
+            last_zone = zone
+
+            for cust in customers:
+                travel_to_cust = cust_zone_distances.get(cust, 0.0) * speed
+                arrive = current_time + travel_to_cust
+
+                # If this is the very first customer of the route, don't start before the earliest TW start
+                if not first_customer_serviced and time_windows:
+                    earliest_service_time = min((tw[0] for tw in time_windows.values()), default=0)
+                    if arrive < earliest_service_time:
+                        arrive = earliest_service_time
+                    first_customer_serviced = True
+
+                route_delivery_times[rid][cust] = arrive
+                current_time = arrive + service_times.get(cust, 0.0)
+
+    return route_delivery_times
+
+def create_initial_solution(routes, travel_times, service_times, customer_zone_distances,
+                                   customer_prefs, time_windows, basket, days, speed=2):
+    # Store original customer counts per cluster before filtering
+    original_customer_counts = {cluster_id: sum(len(customers) for _, customers in cluster_route)
+                                for cluster_id, cluster_route in routes.items()}
+
+    # Map route to customers
+    def build_routes_customers(routes):
+        rc = {}
+        for route_id, cluster_route in routes.items():
+            cust_list = []
+            for _, customers in cluster_route:
+                cust_list.extend(customers)
+            rc[route_id] = cust_list
+        return rc
+
+    # Begin processing:
+    route_delivery_times = get_route_delivery_times(routes, travel_times, service_times,
+                                                   customer_zone_distances, time_windows, speed)
+    routes_customers = build_routes_customers(routes)
+
+    # Score day fits and assign best day per route
+    route_day_scores = score_route_day_fit(routes_customers, customer_prefs, time_windows,
+                                           route_delivery_times, days)
+    route_day_assignment = assign_days_to_routes(route_day_scores)
+
+    print("\nRoute to Day assignments:")
+    for route_id, day in route_day_assignment.items():
+        print(f"Route {route_id}: Day {day}")
+
+    # Assign preferences
+    assigned_preferences = assign_preferences_to_customers(routes_customers, customer_prefs,
+                                                          route_day_assignment, time_windows,
+                                                          route_delivery_times)
+
+    # Filter routes to only customers with assigned preferences
+    filtered_routes = filter_routes_customers_by_assigned_prefs(routes, assigned_preferences)
+
+    # Update route-customer mapping post-filtering
+    routes = filtered_routes
+    routes_customers = build_routes_customers(routes)
+
+    # Optionally recalc delivery times and reassign preferences after filtering (if iterative)
+    route_delivery_times = get_route_delivery_times(routes, travel_times, service_times,
+                                                   customer_zone_distances, time_windows, speed)
+    assigned_preferences = assign_preferences_to_customers(routes_customers, customer_prefs,
+                                                          route_day_assignment, time_windows,
+                                                          route_delivery_times) 
+
+    assigned_total = 0
+    original_total = 0
+    # Print schedules and assignment percentages per cluster
+    for cluster_id, cluster_route in routes.items():
+        print(f"\nCluster {cluster_id} Delivery Schedule with Assigned Preferences:")
+        assigned_count = 0
+        total_customers = 0
+
+        current_time = 0
+        last_zone = 0
+        first_customer_serviced = False
+
+        for zone, customers in cluster_route:
+            dist_zone = travel_times.get((last_zone, zone), travel_times.get((zone, last_zone), BIG_DISTANCE))
+            travel_zone_time = dist_zone * speed
+            current_time += travel_zone_time
+            print(f"Travel from Zone {last_zone} to Zone {zone}: {dist_zone:.2f} km = {travel_zone_time:.1f} min")
+            last_zone = zone
+
+            for cust in customers:
+                cust_dist = customer_zone_distances.get(cust, 0)
+                travel_to_cust = cust_dist * speed
+                arrive = current_time + travel_to_cust
+
+                tw_start, tw_end = time_windows.get(cust, (0, float('inf')))
+                if not first_customer_serviced:
+                    earliest_service_time = max(min(tw[0] for tw in time_windows.values()), tw_start)
+                    if arrive < earliest_service_time:
+                        wait = earliest_service_time - arrive
+                        arrive = earliest_service_time
+                    else:
+                        wait = 0
+                    first_customer_serviced = True
+                else:
+                    wait = 0
+
+                serv_time = service_times.get(cust, 0)
+                leave = arrive + serv_time
+
+                pref = assigned_preferences.get(cust)
+                pref_str = f"Preference(tw {pref['time_window_id']}, day {pref['day_id']}, price {pref['price_id']})" if pref else "No preference assigned"
+                if pref is not None:
+                    assigned_count += 1
+                total_customers += 1
+
+                print(f"Customer {cust} in Zone {zone}: Arrive at {arrive:.1f} min, Leave at {leave:.1f} min "
+                      f"(Travel to cust {travel_to_cust:.1f} min, Wait {wait:.1f} min, Service {serv_time} min), {pref_str}")
+
+                current_time = leave
+
+        original_count = original_customer_counts.get(cluster_id, total_customers)
+        assigned_total += assigned_count
+        original_total += original_count
+        percentage_assigned = (assigned_count / original_count * 100) if original_count else 0
+        print(f"Cluster {cluster_id}: Assigned preferences for {assigned_count}/{original_count} customers "
+              f"({percentage_assigned:.2f}%)")
+    
+    percent = assigned_total/original_total * 100
+    print(f"Assigned preferences for a total of {assigned_total}/{original_total}"f" ({percent:.2f}%)")
+
+    all_customers = set()
+    for cluster_route in routes.values():
+        for _, customers in cluster_route:
+            all_customers.update(customers)
+
+    # Also include any customers referenced in your instance if not all are in routes (optional):
+    # all_customers = set(customer_prefs.keys())
+
+    unassigned_customers = [cust for cust in all_customers if assigned_preferences.get(cust) is None]
+
+    clusters = list(routes.keys())
+    zones = {cid: [zone for zone, _ in routes[cid]] for cid in routes}
+    zone_customers = {(cid, zid): custs for cid in routes for zid, custs in routes[cid]}
+
+    # Option A: return only the solution tuple
+    return (clusters, zones, zone_customers, unassigned_customers, route_day_assignment)
+
+def evaluate_solution(route_delivery_times, assigned_preferences, time_windows, service_times, routes,
+                      all_customers, weights):
+    arrival_late_wt  = weights.get('arrival_late', 1.0)
+    service_late_wt  = weights.get('service_late', 1.0)
+    unassigned_wt    = weights.get('unassigned', 1.0)
+
+    total_penalty = 0.0
+
+    for route_id, cluster_route in routes.items():
+        for zone, customers in cluster_route:
+            for cust in customers:
+                pref = assigned_preferences.get(cust)
+                if pref is None:
+                    continue  # unassigned is penalized globally below
+                tw_id = pref['time_window_id']
+                tw_start, tw_end = time_windows.get(tw_id, (0, float('inf')))
+                arrival = route_delivery_times.get(route_id, {}).get(cust, None)
+                serv_time = service_times.get(cust, 0)
+
+                if arrival > tw_end:
+                    total_penalty += arrival_late_wt * (arrival - tw_end)
+
+                service_end = arrival + serv_time
+                if service_end > tw_end:
+                    total_penalty += service_late_wt * (service_end - tw_end)
+
+    assigned_count = sum(1 for c in all_customers if assigned_preferences.get(c) is not None)
+    unassigned_count = len(all_customers) - assigned_count
+    total_penalty += unassigned_wt * unassigned_count
+
+    return total_penalty
+
+# === Objective wrapper (unchanged formula) ===
+
+def objective_value(assigned_preferences, basket, routes, travel_times):
+    return calculate_objective(assigned_preferences, basket, routes, travel_times)
+
+    
+
+def generate_neighborhood(
+    current_solution,
+    clusters: List[int],
+    zones: Dict[int, List[int]],
+    zone_customers: Dict[Tuple[int, int], List[int]],
+    unassigned_customers: List[int],
+    days: List[int],
+    move: str = 'zone_swap',
+    sample_limit: int = 1000000,
+    customer_zone: Optional[Dict[int, int]] = None,
+    route_day_assignment: Optional[Dict[int, int]] = None,
+    basket: Optional[Dict[int, float]] = None
+):
+    """
+    Generates a neighborhood for the given move type.
+    Returns neighbors as tuples:
+      (clusters_new, zones_new, zone_customers_new, unassigned_new, route_day_assignment_new)
+    """
+    # Required context per move
+    if move in ('insert_unassigned', 'new_route_from_unassigned', 'assign_unassigned_zone_to_new_route') and customer_zone is None:
+        raise ValueError(f"customer_zone mapping is required for move '{move}'")
+    if move in ('day_move', 'merge_routes') and route_day_assignment is None:
+        raise ValueError(f"route_day_assignment is required for move '{move}'")
+
+    # Fast return if nothing to do
+    if sample_limit <= 0:
+        return []
+
+    neighbors = []
+    budget = sample_limit  # total neighbor budget across the move
+
+    # Helpers for targeted copying
+    def zones_with_swap(zs: Dict[int, List[int]], cid: int, i: int, j: int):
+        zs_new = zs.copy()
+        lst = zs[cid].copy()
+        lst[i], lst[j] = lst[j], lst[i]
+        zs_new[cid] = lst
+        return zs_new
+
+    def zc_with_swap_one(zc: Dict[Tuple[int, int], List[int]], cid: int, zid: int, i: int, j: int):
+        zc_new = zc.copy()
+        custs = zc.get((cid, zid), [])
+        if len(custs) < 2:
+            return None
+        lst = custs.copy()
+        lst[i], lst[j] = lst[j], lst[i]
+        zc_new[(cid, zid)] = lst
+        return zc_new
+
+    def zc_with_insert(zc: Dict[Tuple[int, int], List[int]], cid: int, zid: int, pos: int, cust: int):
+        zc_new = zc.copy()
+        lst = zc.get((cid, zid), []).copy()
+        if pos < 0:
+            pos = 0
+        if pos > len(lst):
+            pos = len(lst)
+        lst.insert(pos, cust)
+        zc_new[(cid, zid)] = lst
+        return zc_new
+
+    # Move: swap zone order within a route
+    if move == 'zone_swap':
+        for cluster_id in clusters:
+            zone_list = zones.get(cluster_id, [])
+            if len(zone_list) < 2:
+                continue
+            pairs = list(itertools.combinations(range(len(zone_list)), 2))
+            random.shuffle(pairs)
+            for i, j in pairs:
+                zones_new = zones_with_swap(zones, cluster_id, i, j)
+                neighbors.append((clusters, zones_new, zone_customers, unassigned_customers, route_day_assignment))
+                budget -= 1
+                if budget <= 0:
+                    return neighbors
+
+    # Move: swap two customers within the same zone on a route
+    elif move == 'customer_swap':
+        for cluster_id in clusters:
+            for zone_id in zones.get(cluster_id, []):
+                custs = zone_customers.get((cluster_id, zone_id), [])
+                if len(custs) < 2:
+                    continue
+                pairs = list(itertools.combinations(range(len(custs)), 2))
+                random.shuffle(pairs)
+                for i, j in pairs:
+                    zc_new = zc_with_swap_one(zone_customers, cluster_id, zone_id, i, j)
+                    if zc_new is None:
+                        continue
+                    neighbors.append((clusters, zones, zc_new, unassigned_customers, route_day_assignment))
+                    budget -= 1
+                    if budget <= 0:
+                        return neighbors
+
+    # Move: change the assigned day of a route
+    elif move == 'day_move':
+        for cluster_id in clusters:
+            curr_day = route_day_assignment.get(cluster_id) if route_day_assignment else None
+            for day in days or []:
+                if curr_day is not None and day == curr_day:
+                    continue
+                rda_new = copy.deepcopy(route_day_assignment) if route_day_assignment else {}
+                rda_new[cluster_id] = day
+                neighbors.append((clusters, zones, zone_customers, unassigned_customers, rda_new))
+                budget -= 1
+                if budget <= 0:
+                    return neighbors
+
+    # Move: insert an unassigned customer into an existing route that already contains the zone
+    elif move == 'insert_unassigned_into_same_zone':
+        for cust_id in list(unassigned_customers):
+            z = customer_zone.get(cust_id)
+            if z is None:
+                continue
+            candidate_routes = [cid for cid in clusters if z in zones.get(cid, [])]
+            for rid in candidate_routes:
+                L = len(zone_customers.get((rid, z), []))
+                for pos in range(L + 1):
+                    zc_new = zc_with_insert(zone_customers, rid, z, pos, cust_id)
+                    ua_new = [c for c in unassigned_customers if c != cust_id]
+                    neighbors.append((clusters, zones, zc_new, ua_new, route_day_assignment))
+                    budget -= 1
+                    if budget <= 0:
+                        return neighbors
+
+    # Move: add a missing zone to a route and place all unassigned customers of that zone
+    elif move == 'assign_unassigned_zone_to_new_route':
+        # Group unassigned customers by zone
+        by_zone: Dict[int, List[int]] = {}
+        for c in unassigned_customers:
+            z = customer_zone.get(c)
+            if z is not None:
+                by_zone.setdefault(z, []).append(c)
+
+        # For each zone, try partial additions: all combinations of sizes 1..K drawn
+        # from the top-M customers by basket (to control branching).
+        ZONE_ADD_MAX_SUBSET = 3  # K: max subset size to try
+        ZONE_ADD_TOP_CANDIDATES = 6  # M: consider only top-M customers for subset generation
+        for z, custs in by_zone.items():
+            # sort customers by basket (descending) when basket available
+            if basket:
+                sorted_custs = sorted(custs, key=lambda c: basket.get(c, 0.0), reverse=True)
+            else:
+                sorted_custs = list(custs)
+
+            # limit candidates to top M to avoid combinatorial explosion
+            candidate_list = sorted_custs[:ZONE_ADD_TOP_CANDIDATES]
+
+            for rid in clusters:
+                if z in zones.get(rid, []):
+                    continue
+
+                # generate all combinations of sizes 1..ZONE_ADD_MAX_SUBSET from candidate_list
+                max_k = min(ZONE_ADD_MAX_SUBSET, len(candidate_list))
+                for s in range(1, max_k + 1):
+                    for combo in itertools.combinations(candidate_list, s):
+                        subset = list(combo)
+                        zones_new = zones.copy()
+                        zc_new = zone_customers.copy()
+                        ua_new = [c for c in unassigned_customers if c not in subset]
+
+                        # append zone to route and add only this subset of customers
+                        zones_new[rid] = zones.get(rid, []).copy() + [z]
+                        zc_new[(rid, z)] = zc_new.get((rid, z), []) + subset
+
+                        neighbors.append((clusters, zones_new, zc_new, ua_new, route_day_assignment))
+                        budget -= 1
+                        if budget <= 0:
+                            return neighbors
+
+                # also try adding the whole set (original behavior)
+                if len(sorted_custs) > 0:
+                    zones_new = zones.copy()
+                    zc_new = zone_customers.copy()
+                    ua_new = [c for c in unassigned_customers if c not in sorted_custs]
+                    zones_new[rid] = zones.get(rid, []).copy() + [z]
+                    zc_new[(rid, z)] = zc_new.get((rid, z), []) + list(sorted_custs)
+                    neighbors.append((clusters, zones_new, zc_new, ua_new, route_day_assignment))
+                    budget -= 1
+                    if budget <= 0:
+                        return neighbors
+
+    # Move: merge route j into i (append zones and reattach customers), drop j
+    elif move == 'merge_routes':
+        pairs = [(i, j) for i in clusters for j in clusters if i != j]
+        random.shuffle(pairs)
+        for i, j in pairs:
+            clusters_new = [rid for rid in clusters if rid != j]
+            zones_new = zones.copy()
+            zc_new = zone_customers.copy()
+
+            # Build new zone list for i
+            zi = zones.get(i, []).copy()
+            zj = zones.get(j, []).copy()
+            zones_new[i] = zi + zj
+
+            # Move customer lists for zones belonging to j
+            for zj_id in zj:
+                combined = zc_new.get((i, zj_id), []) + zc_new.get((j, zj_id), [])
+                zc_new[(i, zj_id)] = combined
+                if (j, zj_id) in zc_new:
+                    del zc_new[(j, zj_id)]
+
+            # Remove route j zones entry
+            if j in zones_new:
+                del zones_new[j]
+
+            # Day assignment: remove j
+            rda_new = copy.deepcopy(route_day_assignment) if route_day_assignment else {}
+            if j in rda_new:
+                del rda_new[j]
+
+            neighbors.append((clusters_new, zones_new, zc_new, unassigned_customers, rda_new))
+            budget -= 1
+            if budget <= 0:
+                return neighbors
+
+    # Move: create a new route composed of zones that have unassigned customers
+    elif move == 'new_route_from_unassigned':
+        if unassigned_customers:
+            by_zone: Dict[int, List[int]] = {}
+            for c in unassigned_customers:
+                z = customer_zone.get(c)
+                if z is not None:
+                    by_zone.setdefault(z, []).append(c)
+
+            if by_zone:
+                new_rid = (max(clusters) + 1) if clusters else 1
+                clusters_new = list(clusters) + [new_rid]
+                zones_new = zones.copy()
+                zc_new = zone_customers.copy()
+
+                zones_new[new_rid] = list(by_zone.keys())
+                for z, custs in by_zone.items():
+                    zc_new[(new_rid, z)] = list(custs)
+
+                placed = {c for cs in by_zone.values() for c in cs}
+                ua_new = [c for c in unassigned_customers if c not in placed]
+
+                rda_new = copy.deepcopy(route_day_assignment) if route_day_assignment else {}
+                rda_new[new_rid] = days[0] if days else 1
+
+                neighbors.append((clusters_new, zones_new, zc_new, ua_new, rda_new))
+                # single construction is typically enough; still honor budget if caller wants more
+                budget -= 1
+                if budget <= 0:
+                    return neighbors
+
+    # Move: ejection chain (cross-route customer moves, optionally two-step)
+    elif move == 'ejection_chain':
+        if customer_zone is None:
+            raise ValueError("customer_zone mapping is required for move 'ejection_chain'")
+
+        # small chain length (1 or 2) to keep branching manageable
+        for src_cid in clusters:
+            for zone_id in zones.get(src_cid, []):
+                src_custs = zone_customers.get((src_cid, zone_id), []).copy()
+                if not src_custs:
+                    continue
+                random.shuffle(src_custs)
+                for cust in src_custs:
+                    # candidate target routes that contain the same zone
+                    target_routes = [rid for rid in clusters if rid != src_cid and zone_id in zones.get(rid, [])]
+                    random.shuffle(target_routes)
+                    for tr in target_routes:
+                        L = len(zone_customers.get((tr, zone_id), []))
+                        # try all insertion positions (including append)
+                        for pos in range(L + 1):
+                            # perform single-customer move: src_cid -> tr
+                            zc_new = zone_customers.copy()
+                            # remove from source
+                            src_list = zc_new.get((src_cid, zone_id), []).copy()
+                            if cust not in src_list:
+                                continue
+                            src_list = [c for c in src_list if c != cust]
+                            zc_new[(src_cid, zone_id)] = src_list
+                            # insert into target
+                            tgt_list = zc_new.get((tr, zone_id), []).copy()
+                            if pos < 0:
+                                pos = 0
+                            if pos > len(tgt_list):
+                                pos = len(tgt_list)
+                            tgt_list.insert(pos, cust)
+                            zc_new[(tr, zone_id)] = tgt_list
+
+                            neighbors.append((clusters, zones, zc_new, unassigned_customers, route_day_assignment))
+                            budget -= 1
+                            if budget <= 0:
+                                return neighbors
+
+                            # Try a 2-step chain: pick a victim from tr (excluding the moved cust)
+                            orig_tr_custs = [c for c in zone_customers.get((tr, zone_id), []) if c != cust]
+                            if not orig_tr_custs:
+                                continue
+                            random.shuffle(orig_tr_custs)
+                            for victim in orig_tr_custs:
+                                # other target routes for victim (excluding src_cid and tr)
+                                other_targets = [rid2 for rid2 in clusters if rid2 not in (src_cid, tr) and zone_id in zones.get(rid2, [])]
+                                random.shuffle(other_targets)
+                                for tr2 in other_targets:
+                                    L2 = len(zone_customers.get((tr2, zone_id), []))
+                                    for pos2 in range(L2 + 1):
+                                        zc_new2 = zc_new.copy()
+                                        # remove victim from tr
+                                        lst_tr = zc_new2.get((tr, zone_id), []).copy()
+                                        if victim not in lst_tr:
+                                            continue
+                                        lst_tr = [c for c in lst_tr if c != victim]
+                                        zc_new2[(tr, zone_id)] = lst_tr
+                                        # insert victim into tr2
+                                        lst_tr2 = zc_new2.get((tr2, zone_id), []).copy()
+                                        if pos2 < 0:
+                                            pos2 = 0
+                                        if pos2 > len(lst_tr2):
+                                            pos2 = len(lst_tr2)
+                                        lst_tr2.insert(pos2, victim)
+                                        zc_new2[(tr2, zone_id)] = lst_tr2
+
+                                        neighbors.append((clusters, zones, zc_new2, unassigned_customers, route_day_assignment))
+                                        budget -= 1
+                                        if budget <= 0:
+                                            return neighbors
+
+    # Unknown move => empty neighborhood
+    return neighbors
+
+# 3) Fix evaluate_full argument order and returns
+def evaluate_full(solution, travel_times, service_times, customer_zone_distances, time_windows,
+                  customer_prefs, basket, days, weights, all_customers):
+    routes, route_day_assignment, _ = unpack_solution(solution)
+    routes_customers = {rid: [c for z in routes[rid] for c in z[1]] for rid in routes}
+    rdt = get_route_delivery_times(routes, travel_times, service_times, customer_zone_distances, time_windows, speed=2)
+    ap = assign_preferences_to_customers(routes_customers, customer_prefs, route_day_assignment, time_windows, rdt)
+    pen = evaluate_solution(rdt, ap, time_windows, service_times, routes, all_customers, weights)
+    obj = calculate_objective(ap, basket, routes, travel_times)
+    return obj, pen, ap, route_day_assignment
+
+
+# === Helpers ===
+def unpack_solution(solution):
+    clusters, zones, zone_customers, unassigned_customers, route_day_assignment = solution
+    routes = {
+        cluster_id: [
+            (zone_id, zone_customers.get((cluster_id, zone_id), []))
+            for zone_id in (zones.get(cluster_id, []) if isinstance(zones, dict) else zones[cluster_id])
+        ]
+        for cluster_id in clusters
+    }
+    return routes, route_day_assignment, unassigned_customers
+#####
+
+def local_search(initial_solution, travel_times, service_times, customer_zone_distances, time_windows,
+                                  customer_prefs, basket, days, weights, all_customers,
+                                  sample_limit=1000000, speed=2, max_iters=500,
+                                  move_types=('assign_unassigned_zone_to_new_route',
+                                             'zone_swap', 'customer_swap', 'day_move',
+                                             'merge_routes', 'new_route_from_unassigned'),
+                                  customer_zone=None):
+    """
+    For each iteration, for each move type:
+      - Generate the full neighborhood (subject to sample_limit inside generator).
+      - Evaluate all neighbors, keep the best in that move's neighborhood.
+      - Accept it if it improves the score; then proceed to next move.
+    Stop when a full pass yields no improvement.
+    """
+
+    def evaluate(solution):
+        routes, rda, ua = unpack_solution(solution)
+        routes_customers = {rid: [c for z in routes[rid] for c in z[1]] for rid in routes}
+        rdt = get_route_delivery_times(routes, travel_times, service_times,
+                                       customer_zone_distances, time_windows, speed)
+        ap = assign_preferences_to_customers(routes_customers, customer_prefs, rda, time_windows, rdt)
+
+        # Enforce invariant using your existing filter
+        routes_filtered = filter_routes_customers_by_assigned_prefs(routes, ap)
+        # Allow neighbors that temporarily create unassigned customers.
+        # They will be evaluated normally and receive an unassigned penalty via evaluate_solution.
+        if routes_filtered != routes:
+            newly_unassigned = sum(1 for c in all_customers if ap.get(c) is None)
+            # (optional) we could add an extra penalty here, e.g. extra = newly_unassigned * weights.get('unassigned', 1.0)
+            # but for now rely on evaluate_solution to account for unassigned customers.
+
+        pen = evaluate_solution(rdt, ap, time_windows, service_times, routes_filtered, all_customers, weights)
+        obj = calculate_objective(ap, basket, routes_filtered, travel_times)
+        score = obj - pen
+        return obj, pen, score, ap, rdt
+
+    current_solution = initial_solution
+    curr_obj, curr_pen, curr_score, curr_ap, curr_rdt = evaluate(current_solution)
+
+    for it in range(max_iters):
+        improved_any = False
+
+        # unpack once for neighbor generation calls
+        clusters, zones, zone_customers, unassigned_customers, route_day_assignment = current_solution
+
+        # Evaluate the best neighbor for each move, then pick the global best across moves
+        global_best_nb = None
+        global_best_tuple = (curr_obj, curr_pen, curr_score, curr_ap, curr_rdt)
+        global_best_move = None
+
+        for move in move_types:
+            # Generate neighborhood for this move
+            neighbors = generate_neighborhood(
+                current_solution, clusters, zones, zone_customers, unassigned_customers, days,
+                move=move, sample_limit=sample_limit, customer_zone=customer_zone,
+                route_day_assignment=route_day_assignment, basket=basket
+            )
+
+            # Evaluate neighbors and keep the best for this move
+            best_nb = None
+            best_tuple = (curr_obj, curr_pen, curr_score, curr_ap, curr_rdt)
+            for nb in neighbors:
+                obj, pen, score, ap, rdt = evaluate(nb)
+                if score > best_tuple[2]:
+                    best_nb = nb
+                    best_tuple = (obj, pen, score, ap, rdt)
+
+            # Update global best if this move produced a better candidate
+            if best_nb is not None and best_tuple[2] > global_best_tuple[2]:
+                global_best_nb = best_nb
+                global_best_tuple = best_tuple
+                global_best_move = move
+
+        # After checking all moves, accept the global best if it improves the current score
+        if global_best_nb is not None and global_best_tuple[2] > curr_score:
+            current_solution = global_best_nb
+            curr_obj, curr_pen, curr_score, curr_ap, curr_rdt = global_best_tuple
+            improved_any = True
+            print(f"[Iter {it}] {global_best_move}: improved -> Score {curr_score:.2f} = Obj {curr_obj:.2f} - Pen {curr_pen:.2f}")
+
+            # Update neighborhood bases from accepted solution
+            clusters, zones, zone_customers, unassigned_customers, route_day_assignment = current_solution
+
+        if not improved_any:
+            print(f"[Iter {it}] No improvements across all moves. Stopping.")
+            break
+
+    # Ensure final solution contains only customers with assigned preferences.
+    routes_final, route_day_assignment_final, _ = unpack_solution(current_solution)
+    # Filter routes to keep only customers with assigned preferences
+    routes_filtered = filter_routes_customers_by_assigned_prefs(routes_final, curr_ap)
+
+    # Rebuild filtered solution tuple
+    clusters_filtered = list(routes_filtered.keys())
+    zones_filtered = {cid: [zone for zone, _ in routes_filtered[cid]] for cid in routes_filtered}
+    zone_customers_filtered = {}
+    for cid in routes_filtered:
+        for zone_id, custs in routes_filtered[cid]:
+            zone_customers_filtered[(cid, zone_id)] = custs
+
+    unassigned_customers_filtered = [c for c in all_customers if curr_ap.get(c) is None]
+    route_day_assignment_filtered = {cid: route_day_assignment_final.get(cid) for cid in routes_filtered}
+
+    filtered_solution = (
+        clusters_filtered,
+        zones_filtered,
+        zone_customers_filtered,
+        unassigned_customers_filtered,
+        route_day_assignment_filtered
+    )
+
+    # Recompute delivery times and assigned preferences for the filtered solution
+    rdt_filtered = get_route_delivery_times(routes_filtered, travel_times, service_times, customer_zone_distances, time_windows, speed)
+    routes_customers_filtered = {rid: [c for z in routes_filtered[rid] for c in z[1]] for rid in routes_filtered}
+    final_assigned_prefs = assign_preferences_to_customers(routes_customers_filtered, customer_prefs, route_day_assignment_filtered, time_windows, rdt_filtered)
+    final_pen = evaluate_solution(rdt_filtered, final_assigned_prefs, time_windows, service_times, routes_filtered, all_customers, weights)
+    final_obj = calculate_objective(final_assigned_prefs, basket, routes_filtered, travel_times)
+    final_score = final_obj - final_pen
+
+    return filtered_solution, final_obj, final_pen, final_score, final_assigned_prefs, rdt_filtered
+
+
+
+def print_solution(solution, travel_times, service_times, customer_zone_distances, time_windows,
+                         basket, assigned_preferences, route_day_assignment, route_delivery_times,
+                         all_customers, weights, travel_speed=2):
+    routes, route_day_assgn, unassigned_customers = unpack_solution(solution)
+
+    # Ensure routes only include customers with assigned preferences
+    routes = filter_routes_customers_by_assigned_prefs(routes, assigned_preferences)
+    # Recompute unassigned_customers to reflect filtering
+    unassigned_customers = [c for c in all_customers if assigned_preferences.get(c) is None]
+
+    # Served/unserved sets
+    served = [c for c in all_customers if assigned_preferences.get(c) is not None]
+    unserved = [c for c in all_customers if assigned_preferences.get(c) is None]
+
+    # Totals
+    total_customers = len(all_customers)
+    assigned_count = len(served)
+    assign_pct = (assigned_count / total_customers * 100) if total_customers else 0.0
+
+    # Costs/Revenue, consistent with objective
+    total_basket_served = sum(basket.get(c, 0) for c in served)
+    # Sum actual fees mapped from price ids
+    total_fee = 0.0
+    for c in served:
+        pref = assigned_preferences.get(c)
+        if pref is not None:
+            pid = pref.get('price_id')
+            total_fee += float(PRICE_FEES.get(pid, pid if pid is not None else 0))
+    depot_zone = 0
+    total_distance = 0.0
+    for rid, cluster_route in routes.items():
+        last = depot_zone
+        for zone_id, _ in cluster_route:
+            dist = travel_times.get((last, zone_id), travel_times.get((zone_id, last), BIG_DISTANCE))
+            total_distance += dist
+            last = zone_id
+        total_distance += travel_times.get((last, depot_zone), travel_times.get((depot_zone, last), BIG_DISTANCE))
+    routes_used = len(routes)
+
+    obj = 0.25 * total_basket_served + total_fee - 0.27 * total_distance - 180 * routes_used
+    pen = evaluate_solution(route_delivery_times, assigned_preferences, time_windows,
+                            service_times, routes, all_customers, weights)
+    net = obj - pen
+
+    # Per-cluster detail
+    for rid in routes:
+        day = route_day_assgn.get(rid, 'N/A')
+        print(f"Route/Cluster {rid} (Day {day}):")
+        for zone_id, customers in routes[rid]:
+            print(f"  Zone {zone_id} | #cust {len(customers)}")
+            for cust in customers:
+                arr = route_delivery_times.get(rid, {}).get(cust, None)
+                st = service_times.get(cust, 0)
+                dep = (arr + st) if arr is not None else None
+                pref = assigned_preferences.get(cust)
+                tw = pref['time_window_id'] if pref else None
+                fee = float(PRICE_FEES.get(pref['price_id'], pref['price_id'])) if pref else 0.0
+                arr_s = f"{arr:.1f}" if arr is not None else "N/A"
+                dep_s = f"{dep:.1f}" if dep is not None else "N/A"
+                tw_s  = f"TW {tw}" if tw is not None else "TW N/A"
+                print(f"    Cust {cust}: Arr {arr_s} min, Dep {dep_s} min, {tw_s}, Fee {fee}")
+        print("")
+
+    # Unassigned list
+    print(f"Unassigned customers ({len(unserved)}): {sorted(unserved)}")
+    # Header
+    print("\n=== Final Solution (Readable) ===")
+    print(f"Total customers: {total_customers} | Assigned: {assigned_count} ({assign_pct:.2f}%) | Unassigned: {len(unserved)}")
+    print(f"Revenue from baskets (0.25*sum served basket): {0.25*total_basket_served:.2f}  | Fees: {total_fee}")
+    print(f"Distance: {total_distance:.2f} km | Routes used: {routes_used}")
+    print(f"Objective (profit): {obj:.2f} | Evaluation penalty: {pen:.2f} | Net score: {net:.2f}\n")
+
+if __name__ == '__main__':
+    # Manually set the instance name here
+    instance = 'instances\S333n90d3w6-120p5-4-8c5_1677773750.txt'
+    
+    # Resolve relative paths to absolute
+    if not os.path.isabs(instance):
+        instance = os.path.abspath(os.path.join(os.getcwd(), instance))
+    
+    print(f"Using instance: {instance}")
+    
+    content = read_instance_file(instance)
+
+    # Parse and cluster
+    clusters, zones, zone_ratios, zone_customers, basket = clustering(instance)
+    zones = [int(z) for z in zones] if isinstance(zones, list) else zones
+    zone_ratios = {int(k): v for k, v in zone_ratios.items()}
+    zone_customers = {int(k): v for k, v in zone_customers.items()}
+    basket = {int(k): v for k, v in basket.items()}
+    routes = create_routes_by_cluster(clusters, zones, zone_ratios, zone_customers, basket)
+
+    data = parse_instance(content)
+    # Populate global price->fee mapping for this instance
+    PRICE_FEES = data.get('fees', {})
+    print(f"Parsed Fees (price_id -> fee): {PRICE_FEES}")
+    travel_times = {tuple(map(int, k)): v for k, v in data['travel_times'].items()}
+    service_times = {int(k): v for k, v in data['service_times'].items()}
+    customer_zone_distances = {int(k): v for k, v in parse_customer_zone_distances(content).items()}
+    time_windows = {int(k): v for k, v in parse_time_windows(content).items()}
+    customer_prefs = {int(k): v for k, v in parse_customer_preferences(content).items()}
+    days = [int(d) for d in parse_days(content)]
+    customer_zones = {int(k): int(v) for k, v in parse_customer_zones(content).items()}
+
+    # Ground truth: full original customer set
+    all_customers = {int(c) for c in customer_zones.keys()}
+    all_customers.discard(0)
+
+
+    # Neighbor mappings
+    customer_zone_mapping = customer_zones
+    zone_cluster_mapping = {}
+    if isinstance(zones, dict):
+        zones_for_mapping = zones
+    else:
+        zones_for_mapping = {}
+        for cluster_id, zone_id in zip(clusters, zones):
+            zones_for_mapping.setdefault(int(cluster_id), []).append(int(zone_id))
+    for cluster_id, zone_list in zones_for_mapping.items():
+        for zone_id in zone_list:
+            zone_cluster_mapping[int(zone_id)] = int(cluster_id)
+
+    # Initial constructive
+    initial_solution = create_initial_solution(
+        routes, travel_times, service_times, customer_zone_distances, customer_prefs,
+        time_windows, basket, days, speed=2
+    )
+
+    #Solution tuple
+    #initial_solution = (
+    #    list(routes.keys()),
+    #    {cid: [zone for zone, _ in routes[cid]] for cid in routes},
+    #    {(cid, zid): custs for cid in routes for zid, custs in routes[cid]},
+    #    unassigned_customers,
+    #    route_day_assignment
+    #)
+
+    # Weights
+    weights = {
+        'arrival_late': 0.5,
+        'service_late' : 0.2,
+        'unassigned'   : (np.mean(list(basket.values()))*0.25 if basket else 0.0)
+    }
+
+    move_types = (
+    'assign_unassigned_zone_to_new_route',
+    'zone_swap',
+    'customer_swap',
+    'day_move',
+    'insert_unassigned_into_same_zone',
+    'merge_routes',
+    'new_route_from_unassigned',
+    'ejection_chain')
+
+    # Local search over all moves
+    final_solution, final_obj, final_pen, final_score, final_assigned_prefs, final_rdt = local_search(
+    initial_solution,
+    travel_times, service_times, customer_zone_distances, time_windows,
+    customer_prefs, basket, days, weights, all_customers,
+    customer_zone=customer_zone_mapping,
+    sample_limit=1000000, speed=2, max_iters=500,
+    move_types=move_types)
+
+    # Final readable print
+    # 4) Use final route_day_assignment when printing
+    routes_final, rda_final, _ = unpack_solution(final_solution)
+    print_solution(final_solution, travel_times, service_times, customer_zone_distances, time_windows,
+                basket, final_assigned_prefs, rda_final, final_rdt, all_customers, weights, travel_speed=2)
+
+
+
